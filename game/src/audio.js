@@ -1,25 +1,27 @@
-// Senja Heist — synthesized sound. No audio files, no network: every noise
-// below is an oscillator or a burst of filtered noise built on a lazily
-// created AudioContext. Browsers refuse an AudioContext before the first
-// user gesture, so createAudio() only builds the bookkeeping object; the
-// context itself appears in audioUnlock(), which main.js calls from the
-// first pointerdown / keydown listener.
+// Senja Heist — everything you hear is synthesized live. No audio files
+// and no network: each sound is an oscillator or a burst of filtered
+// noise built on an AudioContext that only exists after the first user
+// gesture. createAudio() just builds the bookkeeping object; the context
+// itself is made in audioUnlock(), which main.js calls from the first
+// pointerdown / keydown listener, because browsers block audio before
+// that first gesture.
 //
-// The bed is adaptive: a calm low pad on the title and planning board, a
-// tense pad with a heartbeat pulse in the heist that quickens as the alarm
-// climbs, and a driving pulse with an engine hum and a two-tone siren in
-// the getaway while the police are chasing. Everything stays quiet on
-// purpose — the mixer sits well under half volume.
+// The bed adapts to the screen: a quiet low pad on the title and planning
+// board, a tense pad with a heartbeat that quickens as the alarm climbs
+// during the heist, and a driving pulse with an engine hum and a two-tone
+// siren in the getaway while the police are chasing. The mixer is kept
+// deliberately low — well under half volume.
 
-const MASTER_LEVEL = 0.42;
-const PAD_LEVEL = 0.05;
-const PULSE_LEVEL = 0.16;
-const SIREN_LEVEL = 0.035;
-const ENGINE_LEVEL = 0.04;
+// Mix levels.
+const MIX_MASTER = 0.42;
+const MIX_PAD = 0.05;
+const MIX_PULSE = 0.16;
+const MIX_SIREN = 0.035;
+const MIX_ENGINE = 0.04;
 
-// Pulse spacing, in seconds, from a calm room to a room at full alarm.
-const PULSE_CALM = 0.95;
-const PULSE_HOT = 0.26;
+// Heartbeat spacing in seconds, from a calm room to one at full alarm.
+const BEAT_CALM = 0.95;
+const BEAT_HOT = 0.26;
 
 /** The audio handle main.js keeps on state.audio. */
 export function createAudio() {
@@ -27,19 +29,23 @@ export function createAudio() {
     ctx: null,
     master: null,
     muted: false,
-    // Bed voices, created once the context exists and kept alive across
+    // Bed voices, built once the context exists and kept alive across
     // screens so the music never restarts mid-phrase.
     pad: null,
     siren: null,
     engine: null,
-    // Timers the bed advances in audioStep().
+    // Bookkeeping the bed advances in audioStep().
     pulseIn: 0,
     bedMode: 'off',
   };
 }
 
-/** Build the context and the master gain, then resume it if suspended. */
-function ensureContext(audio) {
+/**
+ * Build the context and master gain on first use; on later calls just
+ * wake a suspended context. Returns the context, or null when the
+ * browser has no WebAudio at all.
+ */
+function openContext(audio) {
   if (audio.ctx) {
     if (audio.ctx.state === 'suspended') audio.ctx.resume().catch(() => {});
     return audio.ctx;
@@ -48,7 +54,7 @@ function ensureContext(audio) {
   if (!Ctor) return null;
   const ctx = new Ctor();
   const master = ctx.createGain();
-  master.gain.value = audio.muted ? 0 : MASTER_LEVEL;
+  master.gain.value = audio.muted ? 0 : MIX_MASTER;
   master.connect(ctx.destination);
   audio.ctx = ctx;
   audio.master = master;
@@ -56,11 +62,15 @@ function ensureContext(audio) {
 }
 
 export function audioUnlock(audio) {
-  ensureContext(audio);
+  openContext(audio);
 }
 
-/** A one-shot oscillator with an attack/decay envelope. */
-function blip(audio, type, fromHz, toHz, seconds, level, delay = 0) {
+/**
+ * One oscillator note with a fast attack and an exponential tail. A
+ * falling `toHz` makes a pitch drop; pass the same pitch twice for a
+ * steady tone. `delay` schedules the note in the future.
+ */
+function tone(audio, type, fromHz, toHz, seconds, level, delay = 0) {
   const ctx = audio.ctx;
   if (!ctx || !audio.master) return;
   const start = ctx.currentTime + delay;
@@ -78,8 +88,11 @@ function blip(audio, type, fromHz, toHz, seconds, level, delay = 0) {
   osc.stop(start + seconds + 0.05);
 }
 
-/** A short burst of white noise through a band-pass filter. */
-function hiss(audio, seconds, level, centreHz, sweepToHz = 0, delay = 0) {
+/**
+ * A short wash of white noise through a band-pass filter, optionally
+ * sweeping its centre frequency down (or up) over its lifetime.
+ */
+function noise(audio, seconds, level, centreHz, sweepToHz = 0, delay = 0) {
   const ctx = audio.ctx;
   if (!ctx || !audio.master) return;
   const start = ctx.currentTime + delay;
@@ -104,8 +117,8 @@ function hiss(audio, seconds, level, centreHz, sweepToHz = 0, delay = 0) {
   source.stop(start + seconds + 0.05);
 }
 
-/** Start a looping pad voice: two detuned triangles under a low-pass. */
-function startPad(audio) {
+/** Start the looping pad: two detuned triangles under a low-pass filter. */
+function beginPad(audio) {
   const ctx = audio.ctx;
   if (!ctx || audio.pad) return;
   const gain = ctx.createGain();
@@ -113,23 +126,23 @@ function startPad(audio) {
   const filter = ctx.createBiquadFilter();
   filter.type = 'lowpass';
   filter.frequency.value = 320;
-  const low = ctx.createOscillator();
-  low.type = 'triangle';
-  low.frequency.value = 55;
+  const root = ctx.createOscillator();
+  root.type = 'triangle';
+  root.frequency.value = 55;
   const fifth = ctx.createOscillator();
   fifth.type = 'triangle';
   fifth.frequency.value = 82.4;
-  low.connect(filter);
+  root.connect(filter);
   fifth.connect(filter);
   filter.connect(gain);
   gain.connect(audio.master);
-  low.start();
+  root.start();
   fifth.start();
-  audio.pad = { gain, filter, oscillators: [low, fifth] };
+  audio.pad = { gain, filter, oscillators: [root, fifth] };
 }
 
 /** Start the getaway engine: a sawtooth whose pitch follows the car. */
-function startEngine(audio) {
+function beginEngine(audio) {
   const ctx = audio.ctx;
   if (!ctx || audio.engine) return;
   const gain = ctx.createGain();
@@ -148,7 +161,7 @@ function startEngine(audio) {
 }
 
 /** Start the police wail: a sine whose pitch rocks on a slow LFO. */
-function startSiren(audio) {
+function beginSiren(audio) {
   const ctx = audio.ctx;
   if (!ctx || audio.siren) return;
   const gain = ctx.createGain();
@@ -170,7 +183,8 @@ function startSiren(audio) {
   audio.siren = { gain, oscillators: [osc, lfo] };
 }
 
-function stopVoice(voice) {
+/** Fade a bed voice out and stop its oscillators shortly afterwards. */
+function silenceVoice(voice) {
   if (!voice) return;
   if (voice.gain) voice.gain.gain.setTargetAtTime(0, voice.gain.context.currentTime, 0.08);
   const oscillators = voice.oscillators ?? (voice.osc ? [voice.osc] : []);
@@ -180,14 +194,45 @@ function stopVoice(voice) {
 }
 
 /** One low thump: the heartbeat the heist and getaway beds run on. */
-function thump(audio, level) {
-  blip(audio, 'sine', 96, 42, 0.22, level);
+function heartbeat(audio, level) {
+  tone(audio, 'sine', 96, 42, 0.22, level);
+}
+
+/**
+ * A soft whoosh for a smoke canister venting: low-passed noise that swells
+ * in over a tenth of a second and sighs out over the rest — no sharp
+ * attack, so it sits underneath the action instead of cutting through it.
+ */
+function ventWhoosh(audio) {
+  const ctx = audio.ctx;
+  if (!ctx || !audio.master) return;
+  const start = ctx.currentTime;
+  const length = Math.max(1, Math.floor(ctx.sampleRate * 0.7));
+  const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < length; i += 1) data[i] = Math.random() * 2 - 1;
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  const filter = ctx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.setValueAtTime(500, start);
+  filter.frequency.exponentialRampToValueAtTime(180, start + 0.7);
+  filter.Q.value = 0.6;
+  const gain = ctx.createGain();
+  gain.gain.setValueAtTime(0, start);
+  gain.gain.linearRampToValueAtTime(0.1, start + 0.12);
+  gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.7);
+  source.connect(filter);
+  filter.connect(gain);
+  gain.connect(audio.master);
+  source.start(start);
+  source.stop(start + 0.75);
 }
 
 /**
  * Advance the adaptive bed one frame. `state` is the shared game state;
  * the bed reads only `screen`, `alarm`, `police.siren` and `car.speed`,
- * and it does nothing at all while muted or before the first gesture.
+ * and it stays silent while muted or before the first gesture.
  */
 export function audioStep(audio, state, dt) {
   if (!audio.ctx || audio.muted) return;
@@ -201,43 +246,43 @@ export function audioStep(audio, state, dt) {
   if (mode !== audio.bedMode) {
     audio.bedMode = mode;
     if (mode === 'off') {
-      stopVoice(audio.pad);
+      silenceVoice(audio.pad);
       audio.pad = null;
-      stopVoice(audio.engine);
+      silenceVoice(audio.engine);
       audio.engine = null;
-      stopVoice(audio.siren);
+      silenceVoice(audio.siren);
       audio.siren = null;
     }
   }
   if (mode === 'off') return;
 
-  // The pad runs on every live screen; it only changes colour.
-  startPad(audio);
+  // The pad runs on every live screen; only its colour changes.
+  beginPad(audio);
   const tension = inHeist ? Math.min(1, state.alarm / 100) : inGetaway ? 0.75 : 0;
-  const padTarget = onMenu ? PAD_LEVEL * 0.7 : PAD_LEVEL * (0.8 + tension * 0.9);
+  const padTarget = onMenu ? MIX_PAD * 0.7 : MIX_PAD * (0.8 + tension * 0.9);
   audio.pad.gain.gain.setTargetAtTime(padTarget, ctx.currentTime, 0.4);
   audio.pad.filter.frequency.setTargetAtTime(280 + tension * 900, ctx.currentTime, 0.4);
 
   // The heartbeat quickens with the alarm and stays brisk in the chase.
   if (inHeist || inGetaway) {
-    const spacing = inGetaway ? 0.42 : PULSE_CALM + (PULSE_HOT - PULSE_CALM) * tension;
+    const spacing = inGetaway ? 0.42 : BEAT_CALM + (BEAT_HOT - BEAT_CALM) * tension;
     audio.pulseIn -= dt;
     if (audio.pulseIn <= 0) {
       audio.pulseIn = spacing;
-      thump(audio, PULSE_LEVEL * (0.7 + tension * 0.5));
+      heartbeat(audio, MIX_PULSE * (0.7 + tension * 0.5));
     }
   }
 
   // Engine hum follows the getaway car; the siren follows the pursuit.
   if (inGetaway) {
-    startEngine(audio);
+    beginEngine(audio);
     const speedRatio = state.car ? Math.min(1, Math.abs(state.car.speed) / 540) : 0;
-    audio.engine.gain.gain.setTargetAtTime(ENGINE_LEVEL * (0.4 + speedRatio), ctx.currentTime, 0.2);
+    audio.engine.gain.gain.setTargetAtTime(MIX_ENGINE * (0.4 + speedRatio), ctx.currentTime, 0.2);
     audio.engine.osc.frequency.setTargetAtTime(58 + speedRatio * 96, ctx.currentTime, 0.15);
     const chasing = Boolean(state.police && state.police.siren);
     if (chasing) {
-      startSiren(audio);
-      audio.siren.gain.gain.setTargetAtTime(SIREN_LEVEL, ctx.currentTime, 0.3);
+      beginSiren(audio);
+      audio.siren.gain.gain.setTargetAtTime(MIX_SIREN, ctx.currentTime, 0.3);
     } else if (audio.siren) {
       audio.siren.gain.gain.setTargetAtTime(0, ctx.currentTime, 0.3);
     }
@@ -256,63 +301,73 @@ export function sfx(audio, name) {
   if (!audio || !audio.ctx || audio.muted || !audio.master) return;
   switch (name) {
     case 'click':
-      blip(audio, 'square', 840, 660, 0.06, 0.05);
+      tone(audio, 'square', 840, 660, 0.06, 0.05);
       break;
     case 'pickup':
-      blip(audio, 'sine', 660, 660, 0.09, 0.09);
-      blip(audio, 'sine', 990, 990, 0.12, 0.09, 0.07);
+      tone(audio, 'sine', 660, 660, 0.09, 0.09);
+      tone(audio, 'sine', 990, 990, 0.12, 0.09, 0.07);
       break;
     case 'cash':
-      blip(audio, 'triangle', 1174, 1174, 0.07, 0.08);
-      blip(audio, 'triangle', 1568, 1568, 0.1, 0.08, 0.06);
-      blip(audio, 'triangle', 2093, 2093, 0.14, 0.07, 0.12);
+      tone(audio, 'triangle', 1174, 1174, 0.07, 0.08);
+      tone(audio, 'triangle', 1568, 1568, 0.1, 0.08, 0.06);
+      tone(audio, 'triangle', 2093, 2093, 0.14, 0.07, 0.12);
       break;
     case 'crack':
-      hiss(audio, 0.08, 0.12, 2600);
-      blip(audio, 'square', 190, 120, 0.07, 0.06);
+      noise(audio, 0.08, 0.12, 2600);
+      tone(audio, 'square', 190, 120, 0.07, 0.06);
       break;
     case 'pin':
-      blip(audio, 'sine', 1320, 1320, 0.1, 0.1);
-      blip(audio, 'sine', 1760, 1760, 0.16, 0.08, 0.05);
+      tone(audio, 'sine', 1320, 1320, 0.1, 0.1);
+      tone(audio, 'sine', 1760, 1760, 0.16, 0.08, 0.05);
       break;
     case 'vault':
-      blip(audio, 'sine', 130, 52, 0.5, 0.16);
-      hiss(audio, 0.35, 0.06, 300, 90);
-      blip(audio, 'triangle', 392, 392, 0.2, 0.07, 0.28);
+      tone(audio, 'sine', 130, 52, 0.5, 0.16);
+      noise(audio, 0.35, 0.06, 300, 90);
+      tone(audio, 'triangle', 392, 392, 0.2, 0.07, 0.28);
       break;
     case 'door':
-      blip(audio, 'sawtooth', 120, 210, 0.28, 0.05);
-      hiss(audio, 0.2, 0.04, 500, 240);
+      tone(audio, 'sawtooth', 120, 210, 0.28, 0.05);
+      noise(audio, 0.2, 0.04, 500, 240);
       break;
     case 'alarm':
-      blip(audio, 'square', 620, 620, 0.14, 0.07);
-      blip(audio, 'square', 830, 830, 0.14, 0.07, 0.16);
+      tone(audio, 'square', 620, 620, 0.14, 0.07);
+      tone(audio, 'square', 830, 830, 0.14, 0.07, 0.16);
       break;
     case 'lockdown':
-      blip(audio, 'sawtooth', 440, 880, 0.5, 0.09);
-      blip(audio, 'sawtooth', 466, 932, 0.5, 0.09, 0.12);
-      hiss(audio, 0.5, 0.05, 1200, 300);
+      tone(audio, 'sawtooth', 440, 880, 0.5, 0.09);
+      tone(audio, 'sawtooth', 466, 932, 0.5, 0.09, 0.12);
+      noise(audio, 0.5, 0.05, 1200, 300);
       break;
     case 'emp':
-      hiss(audio, 0.55, 0.14, 3200, 140);
-      blip(audio, 'sine', 880, 110, 0.5, 0.07);
+      noise(audio, 0.55, 0.14, 3200, 140);
+      tone(audio, 'sine', 880, 110, 0.5, 0.07);
+      break;
+    case 'smoke':
+      ventWhoosh(audio);
+      break;
+    case 'levelup':
+      // A short rising arpeggio: four bright notes climbing an octave.
+      tone(audio, 'triangle', 523, 523, 0.1, 0.09);
+      tone(audio, 'triangle', 659, 659, 0.1, 0.09, 0.09);
+      tone(audio, 'triangle', 784, 784, 0.1, 0.09, 0.18);
+      tone(audio, 'triangle', 1047, 1047, 0.22, 0.1, 0.27);
       break;
     case 'hit':
-      blip(audio, 'sine', 150, 60, 0.16, 0.14);
-      hiss(audio, 0.1, 0.08, 400);
+      tone(audio, 'sine', 150, 60, 0.16, 0.14);
+      noise(audio, 0.1, 0.08, 400);
       break;
     case 'shot':
-      hiss(audio, 0.09, 0.16, 1800, 500);
-      blip(audio, 'sine', 220, 70, 0.12, 0.12);
+      noise(audio, 0.09, 0.16, 1800, 500);
+      tone(audio, 'sine', 220, 70, 0.12, 0.12);
       break;
     case 'busted':
-      blip(audio, 'triangle', 392, 392, 0.22, 0.09);
-      blip(audio, 'triangle', 311, 311, 0.22, 0.09, 0.2);
-      blip(audio, 'triangle', 233, 220, 0.5, 0.1, 0.4);
+      tone(audio, 'triangle', 392, 392, 0.22, 0.09);
+      tone(audio, 'triangle', 311, 311, 0.22, 0.09, 0.2);
+      tone(audio, 'triangle', 233, 220, 0.5, 0.1, 0.4);
       break;
     case 'siren':
-      blip(audio, 'sine', 700, 990, 0.4, 0.06);
-      blip(audio, 'sine', 990, 700, 0.4, 0.06, 0.42);
+      tone(audio, 'sine', 700, 990, 0.4, 0.06);
+      tone(audio, 'sine', 990, 700, 0.4, 0.06, 0.42);
       break;
     default:
       break;
@@ -323,6 +378,6 @@ export function setMuted(audio, muted) {
   if (!audio) return;
   audio.muted = muted;
   if (audio.master && audio.ctx) {
-    audio.master.gain.setTargetAtTime(muted ? 0 : MASTER_LEVEL, audio.ctx.currentTime, 0.05);
+    audio.master.gain.setTargetAtTime(muted ? 0 : MIX_MASTER, audio.ctx.currentTime, 0.05);
   }
 }

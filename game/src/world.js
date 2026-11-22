@@ -1,58 +1,72 @@
-// world.js — Kota Senja floorplans and street map for SENJA HEIST.
+// world.js — floorplans for the Senja Heist jobs and the getaway street grid.
 //
-// Builds the two places the crew works in: the interior of each job's
-// target (a top-down room with walls, cover, doors, loot and a vault corner)
-// and the street grid the getaway drives through. Everything here is pure
-// geometry over a seeded stream, so the same job + seed always stages the
-// same room. Walls block both movement and sight; cover blocks movement
-// only, so a crouched thief can hide behind a display case but a guard
-// can still see over it. Every room is laid out with at least two open
-// lanes from entry to exit, so no single door or patrol ever seals the job.
+// Two kinds of place get built here. First, the inside of whatever building
+// the crew is hitting: a rectangular floor, ringed by thick outer walls, cut
+// up by a few interior dividers that always leave a wide doorway, and
+// furnished with low cover the crew can crouch behind. Second, the city the
+// getaway drives across: avenues crossing both ways, solid building blocks
+// filling the gaps between them, lamps along the kerbs, a start point on the
+// west side and a safehouse waiting in the far south-east.
+//
+// Nothing here keeps state. A seeded stream goes in, the same plan comes
+// out every time for the same job and seed, so a screenshot run can replay
+// a room exactly. Walls stop both feet and eyes; cover stops feet only, so
+// a guard standing behind a display case can still be seen over it. Doors
+// are the gaps in the dividers: while open they are just floor, and if one
+// ever shuts it becomes solid like a wall.
 
-import { ROOM, CITY, CAMERA } from './config.js';
+import { CAMERA, CITY, ROOM } from './config.js';
 
-/** Outer wall thickness, in pixels. */
-const SHELL = 24;
+/** Thickness of the outer shell that rings every room, in pixels. */
+const EDGE = 24;
 
-/** How far a seeded value may wander from its drafted position. */
-const JITTER = 18;
+/** How far a drafted point is allowed to wander from its sketched spot. */
+const WOBBLE = 18;
 
-/** Small drift applied to a drafted coordinate by the room's stream. */
-function drift(rng, amount) {
-  return (rng.next() * 2 - 1) * amount;
+/** A rectangle, the shared shape for walls, cover, doors and blocks. */
+function box(x, y, w, h) {
+  return { x: x, y: y, w: w, h: h };
 }
 
-/** True when the point sits inside the rectangle (edges count as inside). */
-function pointInRect(x, y, rect) {
-  return x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h;
+/** A small random nudge, symmetric around zero, from the room's stream. */
+function wobble(stream, span) {
+  return (stream.next() * 2 - 1) * span;
+}
+
+/** True when the point lies inside the box, edges included. */
+function inside(px, py, rect) {
+  return px >= rect.x && px <= rect.x + rect.w && py >= rect.y && py <= rect.y + rect.h;
 }
 
 /**
- * Liang-Barsky clip test: true when the segment (ax,ay)-(bx,by) touches
- * or crosses the rectangle. Used for line-of-sight against walls only.
+ * Liang-Barsky clip: true when the straight run from (x1, y1) to (x2, y2)
+ * touches or crosses the box. Sight checks use this against walls alone,
+ * never against cover, so furniture never blocks a guard's view.
  */
-function segmentHitsRect(ax, ay, bx, by, rect) {
-  const dx = bx - ax;
-  const dy = by - ay;
-  let low = 0;
-  let high = 1;
-  const edges = [
-    [-dx, ax - rect.x],
-    [dx, rect.x + rect.w - ax],
-    [-dy, ay - rect.y],
-    [dy, rect.y + rect.h - ay],
+function rayHitsBox(x1, y1, x2, y2, rect) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  let near = 0;
+  let far = 1;
+  const sides = [
+    [-dx, x1 - rect.x],
+    [dx, rect.x + rect.w - x1],
+    [-dy, y1 - rect.y],
+    [dy, rect.y + rect.h - y1],
   ];
-  for (const [p, q] of edges) {
+  for (const pair of sides) {
+    const p = pair[0];
+    const q = pair[1];
     if (p === 0) {
       if (q < 0) return false;
     } else {
-      const t = q / p;
+      const hit = q / p;
       if (p < 0) {
-        if (t > high) return false;
-        if (t > low) low = t;
+        if (hit > far) return false;
+        if (hit > near) near = hit;
       } else {
-        if (t < low) return false;
-        if (t < high) high = t;
+        if (hit < near) return false;
+        if (hit < far) far = hit;
       }
     }
   }
@@ -60,182 +74,216 @@ function segmentHitsRect(ax, ay, bx, by, rect) {
 }
 
 /**
- * One interior partition, drawn as two wall segments with a gap between
- * them. `along` is 'v' (a vertical wall, gap at `gapY`) or 'h'.
+ * A vertical divider spec: a wall running down `x` from `top` to `bottom`,
+ * broken by a doorway centred on `gap` and `wide` pixels across.
  */
-function splitWall(rng, along, fixed, from, to, gapAt, gapWide, thick) {
-  const g = gapAt + drift(rng, JITTER);
-  const half = gapWide / 2;
-  if (along === 'v') {
+function uprightDivider(x, top, bottom, gap, wide, thick) {
+  return { along: 'v', fixed: x, from: top, to: bottom, gapAt: gap, gapWide: wide, thick: thick };
+}
+
+/**
+ * A horizontal divider spec: a wall running across `y` from `left` to
+ * `right`, broken by a doorway centred on `gap` and `wide` pixels across.
+ */
+function flatDivider(y, left, right, gap, wide, thick) {
+  return { along: 'h', fixed: y, from: left, to: right, gapAt: gap, gapWide: wide, thick: thick };
+}
+
+/**
+ * Turn a divider spec into the two solid wall pieces either side of its
+ * doorway, jittering the doorway a little so no two runs feel identical.
+ */
+function splitDivider(stream, spec) {
+  const centre = spec.gapAt + wobble(stream, WOBBLE);
+  const half = spec.gapWide / 2;
+  if (spec.along === 'v') {
     return [
-      { x: fixed, y: from, w: thick, h: Math.max(8, g - half - from) },
-      { x: fixed, y: g + half, w: thick, h: Math.max(8, to - (g + half)) },
+      box(spec.fixed, spec.from, spec.thick, Math.max(8, centre - half - spec.from)),
+      box(spec.fixed, centre + half, spec.thick, Math.max(8, spec.to - (centre + half))),
     ];
   }
   return [
-    { x: from, y: fixed, w: Math.max(8, g - half - from), h: thick },
-    { x: g + half, y: fixed, w: Math.max(8, to - (g + half)), h: thick },
+    box(spec.from, spec.fixed, Math.max(8, centre - half - spec.from), spec.thick),
+    box(centre + half, spec.fixed, Math.max(8, spec.to - (centre + half)), spec.thick),
   ];
 }
 
 // ---------------------------------------------------------------------------
-// Rooms
+// Job floorplans
 // ---------------------------------------------------------------------------
+//
+// Every plan is a sketch for the 1120x640 floor: where the crew slips in,
+// where they slip out, which dividers split the floor, what low furniture
+// gives cover, where the takings sit, where the vault hides when the job
+// has one, which lanes the guards patrol, and where the cameras mount.
+// The sketches are drafted generously — every doorway is wide and every
+// plan keeps at least two open lanes from entry to exit — so the jitter
+// applied at build time can never seal a room shut.
 
-/**
- * Drafted floorplan per job: where the crew comes in, where they leave,
- * which rooms the interior is split into, and where the valuables sit.
- * Coordinates are drafted for the 1120x640 room and jittered at build
- * time; every partition leaves a wide gap, so each plan keeps at least
- * two lanes open between entry and exit.
- */
-const FLOOR_DRAFTS = {
-  pawnshop: {
-    entry: { x: 78, y: 566 },
-    exit: { x: 1042, y: 74 },
-    partitions: [
-      { along: 'v', fixed: 430, from: 60, to: 580, gapAt: 320, gapWide: 150, thick: 16 },
-      { along: 'h', fixed: 420, from: 560, to: 1060, gapAt: 830, gapWide: 140, thick: 16 },
+/** The pawnshop: a small shop, split once each way, cases along the walls. */
+function planPawnshop() {
+  return {
+    enter: { x: 78, y: 566 },
+    leave: { x: 1042, y: 74 },
+    dividers: [
+      uprightDivider(430, 60, 580, 320, 150, 16),
+      flatDivider(420, 560, 1060, 830, 140, 16),
     ],
-    cover: [
-      { x: 150, y: 150, w: 170, h: 44 },
-      { x: 170, y: 330, w: 44, h: 130 },
-      { x: 620, y: 140, w: 200, h: 44 },
-      { x: 760, y: 470, w: 44, h: 110 },
-      { x: 900, y: 300, w: 130, h: 44 },
+    furniture: [
+      box(150, 150, 170, 44),
+      box(170, 330, 44, 130),
+      box(620, 140, 200, 44),
+      box(760, 470, 44, 110),
+      box(900, 300, 130, 44),
     ],
-    lootKinds: ['cash', 'cash', 'jewels'],
-    lootAt: [
+    kinds: ['cash', 'cash', 'jewels'],
+    stash: [
       { x: 250, y: 110 },
       { x: 700, y: 110 },
       { x: 950, y: 480 },
     ],
-    vaultAt: null,
-    lanes: [
+    vault: null,
+    patrols: [
       [{ x: 200, y: 560 }, { x: 200, y: 110 }, { x: 700, y: 110 }, { x: 1000, y: 120 }],
       [{ x: 500, y: 560 }, { x: 520, y: 320 }, { x: 950, y: 250 }, { x: 1020, y: 180 }],
     ],
-    camAt: [{ x: 1068, y: 56, angle: Math.PI * 0.82 }],
-  },
-  jewellers: {
-    entry: { x: 78, y: 74 },
-    exit: { x: 1042, y: 566 },
-    partitions: [
-      { along: 'v', fixed: 620, from: 60, to: 580, gapAt: 200, gapWide: 140, thick: 16 },
-      { along: 'h', fixed: 230, from: 60, to: 560, gapAt: 300, gapWide: 150, thick: 16 },
+    mounts: [{ x: 1068, y: 56, angle: Math.PI * 0.82 }],
+  };
+}
+
+/** The jewellers: long display counters down the middle, gems everywhere. */
+function planJewellers() {
+  return {
+    enter: { x: 78, y: 74 },
+    leave: { x: 1042, y: 566 },
+    dividers: [
+      uprightDivider(620, 60, 580, 200, 140, 16),
+      flatDivider(230, 60, 560, 300, 150, 16),
     ],
-    cover: [
-      { x: 240, y: 300, w: 220, h: 46 },
-      { x: 330, y: 420, w: 46, h: 130 },
-      { x: 760, y: 150, w: 46, h: 150 },
-      { x: 820, y: 400, w: 170, h: 46 },
-      { x: 180, y: 480, w: 130, h: 44 },
+    furniture: [
+      box(240, 300, 220, 46),
+      box(330, 420, 46, 130),
+      box(760, 150, 46, 150),
+      box(820, 400, 170, 46),
+      box(180, 480, 130, 44),
     ],
-    lootKinds: ['jewels', 'jewels', 'cash', 'jewels'],
-    lootAt: [
+    kinds: ['jewels', 'jewels', 'cash', 'jewels'],
+    stash: [
       { x: 350, y: 280 },
       { x: 950, y: 140 },
       { x: 150, y: 460 },
       { x: 900, y: 520 },
     ],
-    vaultAt: null,
-    lanes: [
+    vault: null,
+    patrols: [
       [{ x: 150, y: 200 }, { x: 500, y: 200 }, { x: 620, y: 460 }, { x: 980, y: 520 }],
       [{ x: 350, y: 90 }, { x: 700, y: 90 }, { x: 900, y: 300 }, { x: 1000, y: 520 }],
     ],
-    camAt: [
+    mounts: [
       { x: 56, y: 56, angle: Math.PI * 0.2 },
       { x: 1068, y: 584, angle: -Math.PI * 0.8 },
     ],
-  },
-  gallery: {
-    entry: { x: 78, y: 320 },
-    exit: { x: 1042, y: 320 },
-    partitions: [
-      { along: 'v', fixed: 380, from: 60, to: 580, gapAt: 470, gapWide: 150, thick: 16 },
-      { along: 'v', fixed: 760, from: 60, to: 580, gapAt: 170, gapWide: 150, thick: 16 },
-      { along: 'h', fixed: 470, from: 820, to: 1060, gapAt: 950, gapWide: 120, thick: 16 },
+  };
+}
+
+/** The gallery: three open halls in a row, art on the walls, vault at back. */
+function planGallery() {
+  return {
+    enter: { x: 78, y: 320 },
+    leave: { x: 1042, y: 320 },
+    dividers: [
+      uprightDivider(380, 60, 580, 470, 150, 16),
+      uprightDivider(760, 60, 580, 170, 150, 16),
+      flatDivider(470, 820, 1060, 950, 120, 16),
     ],
-    cover: [
-      { x: 150, y: 130, w: 120, h: 46 },
-      { x: 500, y: 120, w: 46, h: 120 },
-      { x: 470, y: 420, w: 140, h: 46 },
-      { x: 880, y: 130, w: 120, h: 46 },
-      { x: 880, y: 480, w: 140, h: 46 },
+    furniture: [
+      box(150, 130, 120, 46),
+      box(500, 120, 46, 120),
+      box(470, 420, 140, 46),
+      box(880, 130, 120, 46),
+      box(880, 480, 140, 46),
     ],
-    lootKinds: ['art', 'art', 'cash', 'jewels'],
-    lootAt: [
+    kinds: ['art', 'art', 'cash', 'jewels'],
+    stash: [
       { x: 210, y: 110 },
       { x: 560, y: 320 },
       { x: 940, y: 110 },
       { x: 720, y: 550 },
     ],
-    vaultAt: { x: 1000, y: 560 },
-    lanes: [
+    vault: { x: 1000, y: 560 },
+    patrols: [
       [{ x: 200, y: 320 }, { x: 380, y: 500 }, { x: 700, y: 500 }, { x: 1000, y: 320 }],
       [{ x: 200, y: 320 }, { x: 380, y: 140 }, { x: 700, y: 140 }, { x: 1000, y: 320 }],
     ],
-    camAt: [
+    mounts: [
       { x: 56, y: 56, angle: Math.PI * 0.25 },
       { x: 1068, y: 56, angle: Math.PI * 0.75 },
       { x: 560, y: 584, angle: -Math.PI * 0.5 },
     ],
-  },
-  bank: {
-    entry: { x: 78, y: 566 },
-    exit: { x: 1042, y: 74 },
-    partitions: [
-      { along: 'v', fixed: 480, from: 60, to: 580, gapAt: 300, gapWide: 140, thick: 18 },
-      { along: 'v', fixed: 800, from: 60, to: 580, gapAt: 480, gapWide: 140, thick: 18 },
-      { along: 'h', fixed: 200, from: 830, to: 1060, gapAt: 950, gapWide: 130, thick: 18 },
-      { along: 'h', fixed: 470, from: 60, to: 420, gapAt: 240, gapWide: 140, thick: 18 },
+  };
+}
+
+/** The bank: a teller hall, a back office, and the vault cage up top. */
+function planBank() {
+  return {
+    enter: { x: 78, y: 566 },
+    leave: { x: 1042, y: 74 },
+    dividers: [
+      uprightDivider(480, 60, 580, 300, 140, 18),
+      uprightDivider(800, 60, 580, 480, 140, 18),
+      flatDivider(200, 830, 1060, 950, 130, 18),
+      flatDivider(470, 60, 420, 240, 140, 18),
     ],
-    cover: [
-      { x: 160, y: 130, w: 180, h: 46 },
-      { x: 560, y: 120, w: 46, h: 150 },
-      { x: 560, y: 400, w: 180, h: 46 },
-      { x: 880, y: 300, w: 46, h: 140 },
-      { x: 180, y: 330, w: 46, h: 130 },
+    furniture: [
+      box(160, 130, 180, 46),
+      box(560, 120, 46, 150),
+      box(560, 400, 180, 46),
+      box(880, 300, 46, 140),
+      box(180, 330, 46, 130),
     ],
-    lootKinds: ['cash', 'gold', 'cash', 'data', 'gold'],
-    lootAt: [
+    kinds: ['cash', 'gold', 'cash', 'data', 'gold'],
+    stash: [
       { x: 250, y: 110 },
       { x: 640, y: 320 },
       { x: 940, y: 480 },
       { x: 940, y: 140 },
       { x: 250, y: 520 },
     ],
-    vaultAt: { x: 1010, y: 120 },
-    lanes: [
+    vault: { x: 1010, y: 120 },
+    patrols: [
       [{ x: 200, y: 560 }, { x: 300, y: 300 }, { x: 640, y: 300 }, { x: 900, y: 140 }, { x: 1010, y: 90 }],
       [{ x: 420, y: 560 }, { x: 480, y: 480 }, { x: 800, y: 480 }, { x: 950, y: 320 }, { x: 1010, y: 140 }],
     ],
-    camAt: [
+    mounts: [
       { x: 56, y: 56, angle: Math.PI * 0.2 },
       { x: 1068, y: 56, angle: Math.PI * 0.8 },
       { x: 56, y: 584, angle: -Math.PI * 0.25 },
       { x: 1068, y: 584, angle: -Math.PI * 0.75 },
     ],
-  },
-  museum: {
-    entry: { x: 560, y: 586 },
-    exit: { x: 560, y: 54 },
-    partitions: [
-      { along: 'v', fixed: 360, from: 60, to: 580, gapAt: 180, gapWide: 140, thick: 18 },
-      { along: 'v', fixed: 760, from: 60, to: 580, gapAt: 460, gapWide: 140, thick: 18 },
-      { along: 'h', fixed: 320, from: 60, to: 340, gapAt: 200, gapWide: 130, thick: 18 },
-      { along: 'h', fixed: 320, from: 780, to: 1060, gapAt: 920, gapWide: 130, thick: 18 },
+  };
+}
+
+/** The museum: a grand hall down the middle, wings on both sides. */
+function planMuseum() {
+  return {
+    enter: { x: 560, y: 586 },
+    leave: { x: 560, y: 54 },
+    dividers: [
+      uprightDivider(360, 60, 580, 180, 140, 18),
+      uprightDivider(760, 60, 580, 460, 140, 18),
+      flatDivider(320, 60, 340, 200, 130, 18),
+      flatDivider(320, 780, 1060, 920, 130, 18),
     ],
-    cover: [
-      { x: 120, y: 120, w: 140, h: 46 },
-      { x: 200, y: 420, w: 46, h: 130 },
-      { x: 500, y: 240, w: 120, h: 46 },
-      { x: 850, y: 120, w: 140, h: 46 },
-      { x: 880, y: 420, w: 46, h: 130 },
-      { x: 500, y: 470, w: 120, h: 46 },
+    furniture: [
+      box(120, 120, 140, 46),
+      box(200, 420, 46, 130),
+      box(500, 240, 120, 46),
+      box(850, 120, 140, 46),
+      box(880, 420, 46, 130),
+      box(500, 470, 120, 46),
     ],
-    lootKinds: ['art', 'gold', 'art', 'jewels', 'data', 'art'],
-    lootAt: [
+    kinds: ['art', 'gold', 'art', 'jewels', 'data', 'art'],
+    stash: [
       { x: 190, y: 100 },
       { x: 560, y: 220 },
       { x: 920, y: 100 },
@@ -243,133 +291,261 @@ const FLOOR_DRAFTS = {
       { x: 130, y: 540 },
       { x: 560, y: 420 },
     ],
-    vaultAt: { x: 1040, y: 90 },
-    lanes: [
+    vault: { x: 1040, y: 90 },
+    patrols: [
       [{ x: 560, y: 540 }, { x: 360, y: 460 }, { x: 360, y: 180 }, { x: 560, y: 120 }],
       [{ x: 560, y: 540 }, { x: 760, y: 460 }, { x: 760, y: 180 }, { x: 560, y: 120 }],
       [{ x: 560, y: 540 }, { x: 560, y: 320 }, { x: 560, y: 120 }],
     ],
-    camAt: [
+    mounts: [
       { x: 56, y: 56, angle: Math.PI * 0.25 },
       { x: 1068, y: 56, angle: Math.PI * 0.75 },
       { x: 56, y: 584, angle: -Math.PI * 0.2 },
       { x: 1068, y: 584, angle: -Math.PI * 0.8 },
       { x: 560, y: 56, angle: Math.PI * 0.5 },
     ],
-  },
+  };
+}
+
+/**
+ * The casino: one big gaming floor. Three rows of slot machines run across
+ * the room with open lanes between them, a long bar sits in the middle, and
+ * the cashier cage — two dividers closing off the top-right corner — hides
+ * the vault behind it. The crew comes in at the bottom-left doors and slips
+ * out through the service door at the top-right, right past the cage. Both
+ * cage dividers leave a wide doorway, so the vault is never locked behind a
+ * single choke point, and one taking sits inside the cage itself for the
+ * crew willing to go in after the vault.
+ */
+function planCasino() {
+  return {
+    enter: { x: 78, y: 566 },
+    leave: { x: 1042, y: 74 },
+    dividers: [
+      uprightDivider(880, 60, 300, 240, 130, 16),
+      flatDivider(300, 880, 1060, 980, 130, 16),
+    ],
+    furniture: [
+      box(150, 140, 170, 44),
+      box(400, 140, 170, 44),
+      box(650, 140, 170, 44),
+      box(470, 270, 180, 46),
+      box(150, 330, 170, 44),
+      box(400, 330, 170, 44),
+      box(650, 330, 170, 44),
+      box(150, 480, 170, 44),
+      box(400, 480, 170, 44),
+      box(650, 480, 170, 44),
+      box(900, 330, 140, 44),
+    ],
+    kinds: ['cash', 'cash', 'gold', 'cash', 'jewels'],
+    stash: [
+      { x: 250, y: 110 },
+      { x: 600, y: 110 },
+      { x: 250, y: 420 },
+      { x: 600, y: 560 },
+      { x: 960, y: 230 },
+    ],
+    vault: { x: 990, y: 190 },
+    patrols: [
+      [{ x: 120, y: 560 }, { x: 120, y: 120 }, { x: 560, y: 120 }, { x: 1000, y: 120 }],
+      [{ x: 500, y: 560 }, { x: 520, y: 420 }, { x: 950, y: 420 }, { x: 1020, y: 200 }],
+      [{ x: 900, y: 560 }, { x: 900, y: 420 }, { x: 700, y: 250 }, { x: 300, y: 120 }],
+    ],
+    mounts: [
+      { x: 56, y: 56, angle: Math.PI * 0.2 },
+      { x: 1068, y: 584, angle: -Math.PI * 0.8 },
+      { x: 560, y: 56, angle: Math.PI * 0.5 },
+      { x: 1068, y: 320, angle: Math.PI },
+    ],
+  };
+}
+
+/**
+ * The penthouse: a luxury flat on the top floor. The lounge stays wide open
+ * — long sofas, a grand piano, planters — so sightlines run the whole room,
+ * while a divider splits off the bedroom wing on the right and a second one
+ * closes the study in the top-right corner, where the vault sits. The exit
+ * is the balcony door at the top-right, past the study. Because the lounge
+ * has only two dividers, a guard standing at one end can watch the other;
+ * the piano and sofas are the only honest cover, so the crew crosses the
+ * open floor between patrols rather than hugging walls.
+ */
+function planPenthouse() {
+  return {
+    enter: { x: 78, y: 566 },
+    leave: { x: 1042, y: 74 },
+    dividers: [
+      uprightDivider(700, 60, 580, 320, 150, 16),
+      flatDivider(360, 700, 1060, 880, 140, 16),
+    ],
+    furniture: [
+      box(170, 140, 230, 50),
+      box(170, 430, 230, 50),
+      box(450, 270, 190, 70),
+      box(640, 110, 44, 44),
+      box(640, 500, 44, 44),
+      box(470, 130, 130, 44),
+      box(850, 430, 170, 50),
+    ],
+    kinds: ['jewels', 'art', 'cash', 'gold', 'jewels'],
+    stash: [
+      { x: 300, y: 110 },
+      { x: 560, y: 210 },
+      { x: 950, y: 150 },
+      { x: 900, y: 540 },
+      { x: 250, y: 540 },
+    ],
+    vault: { x: 1000, y: 140 },
+    patrols: [
+      [{ x: 120, y: 560 }, { x: 120, y: 120 }, { x: 600, y: 120 }, { x: 1000, y: 120 }],
+      [{ x: 560, y: 560 }, { x: 660, y: 320 }, { x: 950, y: 320 }, { x: 1000, y: 200 }],
+      [{ x: 900, y: 560 }, { x: 660, y: 500 }, { x: 300, y: 320 }, { x: 300, y: 120 }],
+    ],
+    mounts: [
+      { x: 56, y: 584, angle: -Math.PI * 0.2 },
+      { x: 1068, y: 56, angle: Math.PI * 0.8 },
+      { x: 560, y: 56, angle: Math.PI * 0.5 },
+    ],
+  };
+}
+
+/** A plain two-lane room for any job id with no sketch of its own yet. */
+function planGeneric() {
+  return {
+    enter: { x: 78, y: 566 },
+    leave: { x: 1042, y: 74 },
+    dividers: [
+      uprightDivider(560, 60, 580, 320, 160, 16),
+    ],
+    furniture: [
+      box(200, 150, 160, 44),
+      box(700, 400, 160, 44),
+    ],
+    kinds: ['cash', 'jewels'],
+    stash: [
+      { x: 300, y: 130 },
+      { x: 900, y: 500 },
+    ],
+    vault: null,
+    patrols: [
+      [{ x: 200, y: 560 }, { x: 200, y: 200 }, { x: 900, y: 150 }],
+      [{ x: 500, y: 560 }, { x: 560, y: 320 }, { x: 1000, y: 200 }],
+    ],
+    mounts: [{ x: 1068, y: 56, angle: Math.PI * 0.75 }],
+  };
+}
+
+/** Job id to sketch function. Unknown ids fall back to the generic room. */
+const PLANS = {
+  pawnshop: planPawnshop,
+  jewellers: planJewellers,
+  gallery: planGallery,
+  bank: planBank,
+  museum: planMuseum,
+  casino: planCasino,
+  penthouse: planPenthouse,
 };
 
-/** Fallback draft for a job id the table does not know yet. */
-const GENERIC_DRAFT = {
-  entry: { x: 78, y: 566 },
-  exit: { x: 1042, y: 74 },
-  partitions: [
-    { along: 'v', fixed: 560, from: 60, to: 580, gapAt: 320, gapWide: 160, thick: 16 },
-  ],
-  cover: [
-    { x: 200, y: 150, w: 160, h: 44 },
-    { x: 700, y: 400, w: 160, h: 44 },
-  ],
-  lootKinds: ['cash', 'jewels'],
-  lootAt: [
-    { x: 300, y: 130 },
-    { x: 900, y: 500 },
-  ],
-  vaultAt: null,
-  lanes: [
-    [{ x: 200, y: 560 }, { x: 200, y: 200 }, { x: 900, y: 150 }],
-    [{ x: 500, y: 560 }, { x: 560, y: 320 }, { x: 1000, y: 200 }],
-  ],
-  camAt: [{ x: 1068, y: 56, angle: Math.PI * 0.75 }],
-};
-
-/** The four outer walls that close the room. */
-function shellWalls() {
+/** The four thick walls that close a room off from the outside. */
+function perimeterWalls() {
   return [
-    { x: 0, y: 0, w: ROOM.width, h: SHELL },
-    { x: 0, y: ROOM.height - SHELL, w: ROOM.width, h: SHELL },
-    { x: 0, y: 0, w: SHELL, h: ROOM.height },
-    { x: ROOM.width - SHELL, y: 0, w: SHELL, h: ROOM.height },
+    box(0, 0, ROOM.width, EDGE),
+    box(0, ROOM.height - EDGE, ROOM.width, EDGE),
+    box(0, 0, EDGE, ROOM.height),
+    box(ROOM.width - EDGE, 0, EDGE, ROOM.height),
   ];
 }
 
 /**
- * Build one job's interior. Guard posts walk the drafted lanes (each
- * guard gets its own lane, wrapping when the lanes run out); camera posts
- * sit on the drafted mounts. Counts come from the job, so a bigger job
- * simply staffs more of the same floor.
+ * Steps a spot must try, in order, when it lands on solid ground: the four
+ * compass directions close by, then further out, then the diagonals. The
+ * first open tile wins.
  */
-export function buildRoom(rng, job) {
-  const draft = FLOOR_DRAFTS[job?.id] ?? GENERIC_DRAFT;
-  const walls = shellWalls();
-  for (const part of draft.partitions) {
-    walls.push(...splitWall(rng, part.along, part.fixed, part.from, part.to, part.gapAt, part.gapWide, part.thick));
+const ESCAPE_STEPS = [
+  [0, -44], [44, 0], [0, 44], [-44, 0],
+  [0, -88], [88, 0], [0, 88], [-88, 0],
+  [64, -64], [-64, -64], [64, 64], [-64, 64],
+];
+
+/**
+ * Stage one job's interior from its sketch. Guards walk the sketched lanes
+ * — each guard takes the next lane, wrapping round when the lanes run out —
+ * and cameras sit on the sketched mounts, again wrapping if a big job
+ * staffs more cameras than there are mounts. Counts come from the job, so a
+ * bigger crew simply fills more of the same floor.
+ */
+export function buildRoom(stream, job) {
+  const sketch = (PLANS[job?.id] ?? planGeneric)();
+  const walls = perimeterWalls();
+  for (const spec of sketch.dividers) {
+    walls.push(...splitDivider(stream, spec));
   }
-  const cover = draft.cover.map((c) => ({
-    x: c.x + drift(rng, JITTER),
-    y: c.y + drift(rng, JITTER),
-    w: c.w,
-    h: c.h,
+  const cover = sketch.furniture.map((piece) => ({
+    x: piece.x + wobble(stream, WOBBLE),
+    y: piece.y + wobble(stream, WOBBLE),
+    w: piece.w,
+    h: piece.h,
   }));
-  const doors = draft.partitions.map((part) => {
-    if (part.along === 'v') {
-      return { x: part.fixed - 8, y: part.gapAt - part.gapWide / 2, w: 32, h: part.gapWide, open: true };
+  const doors = sketch.dividers.map((spec) => {
+    if (spec.along === 'v') {
+      return { x: spec.fixed - 8, y: spec.gapAt - spec.gapWide / 2, w: 32, h: spec.gapWide, open: true };
     }
-    return { x: part.gapAt - part.gapWide / 2, y: part.fixed - 8, w: part.gapWide, h: 32, open: true };
+    return { x: spec.gapAt - spec.gapWide / 2, y: spec.fixed - 8, w: spec.gapWide, h: 32, open: true };
   });
-  const lootSpots = draft.lootKinds.map((kind, i) => {
-    const at = draft.lootAt[i % draft.lootAt.length];
-    return { x: at.x + drift(rng, JITTER), y: at.y + drift(rng, JITTER), kind };
+  const lootSpots = sketch.kinds.map((kind, i) => {
+    const at = sketch.stash[i % sketch.stash.length];
+    return { x: at.x + wobble(stream, WOBBLE), y: at.y + wobble(stream, WOBBLE), kind: kind };
   });
-  const guardCount = Math.max(0, job?.guards ?? 0);
+  const guardTotal = Math.max(0, job?.guards ?? 0);
   const guardPosts = [];
-  for (let i = 0; i < guardCount; i += 1) {
-    const lane = draft.lanes[i % draft.lanes.length];
-    const route = lane.map((p) => ({ x: p.x + drift(rng, JITTER), y: p.y + drift(rng, JITTER) }));
-    guardPosts.push({ x: route[0].x, y: route[0].y, route });
+  // Hand the lanes out round-robin: guard zero takes lane zero, guard one
+  // takes lane one, and once the lanes run out they start again from the
+  // top, so a seven-guard casino still patrols the same three lanes.
+  for (let i = 0; i < guardTotal; i += 1) {
+    const lane = sketch.patrols[i % sketch.patrols.length];
+    const route = lane.map((p) => ({ x: p.x + wobble(stream, WOBBLE), y: p.y + wobble(stream, WOBBLE) }));
+    guardPosts.push({ x: route[0].x, y: route[0].y, route: route });
   }
-  const camCount = Math.max(0, job?.cameras ?? 0);
+  const camTotal = Math.max(0, job?.cameras ?? 0);
   const camPosts = [];
-  for (let i = 0; i < camCount; i += 1) {
-    const mount = draft.camAt[i % draft.camAt.length];
+  for (let i = 0; i < camTotal; i += 1) {
+    const mount = sketch.mounts[i % sketch.mounts.length];
     camPosts.push({
-      x: mount.x + drift(rng, 6),
-      y: mount.y + drift(rng, 6),
-      angle: mount.angle + drift(rng, 0.12),
+      x: mount.x + wobble(stream, 6),
+      y: mount.y + wobble(stream, 6),
+      angle: mount.angle + wobble(stream, 0.12),
       sweep: CAMERA.sweep,
     });
   }
-  const vaultSpot = draft.vaultAt && job?.vault
-    ? { x: draft.vaultAt.x + drift(rng, 8), y: draft.vaultAt.y + drift(rng, 8) }
+  const vaultSpot = sketch.vault && job?.vault
+    ? { x: sketch.vault.x + wobble(stream, 8), y: sketch.vault.y + wobble(stream, 8) }
     : null;
   const room = {
     name: job?.target ?? 'Kota Senja',
     w: ROOM.width,
     h: ROOM.height,
-    entry: { x: draft.entry.x, y: draft.entry.y },
-    exit: { x: draft.exit.x, y: draft.exit.y },
-    walls,
-    cover,
-    doors,
-    lootSpots,
-    vaultSpot,
-    guardPosts,
-    camPosts,
+    entry: { x: sketch.enter.x, y: sketch.enter.y },
+    exit: { x: sketch.leave.x, y: sketch.leave.y },
+    walls: walls,
+    cover: cover,
+    doors: doors,
+    lootSpots: lootSpots,
+    vaultSpot: vaultSpot,
+    guardPosts: guardPosts,
+    camPosts: camPosts,
   };
-  // Seeded jitter can push a loot spot into a case or a wall. Nudge any
-  // spot that landed on solid ground out to the nearest open floor, so
-  // every valuable is always standing on walkable tiles.
-  const nudges = [
-    [0, -44], [44, 0], [0, 44], [-44, 0],
-    [0, -88], [88, 0], [0, 88], [-88, 0],
-    [64, -64], [-64, -64], [64, 64], [-64, 64],
-  ];
+  // Jitter can shove a taking onto a case or into a wall. Walk each spot
+  // that landed on solid ground out to the nearest open tile, so every
+  // valuable in the room is always standing somewhere reachable. Entry,
+  // exit and vault spots are sketched clear of walls and cover on purpose,
+  // so they never need this rescue — only the jittered loot does.
   for (const spot of room.lootSpots) {
     if (!roomSolidAt(room, spot.x, spot.y)) continue;
-    for (const [dx, dy] of nudges) {
-      if (!roomSolidAt(room, spot.x + dx, spot.y + dy)) {
-        spot.x += dx;
-        spot.y += dy;
+    for (const step of ESCAPE_STEPS) {
+      if (!roomSolidAt(room, spot.x + step[0], spot.y + step[1])) {
+        spot.x += step[0];
+        spot.y += step[1];
         break;
       }
     }
@@ -377,106 +553,121 @@ export function buildRoom(rng, job) {
   return room;
 }
 
-/** True when the point is inside a wall, a piece of cover, or a shut door, or outside the room. */
-export function roomSolidAt(room, x, y) {
-  if (!room) return true;
-  if (x < 0 || y < 0 || x > room.w || y > room.h) return true;
-  for (const wall of room.walls) if (pointInRect(x, y, wall)) return true;
-  for (const piece of room.cover) if (pointInRect(x, y, piece)) return true;
+/**
+ * True when the point cannot be stood on: outside the room, inside a wall,
+ * inside a piece of cover, or inside a door that has shut. Open doors are
+ * just floor.
+ */
+export function roomSolidAt(room, px, py) {
+  if (room == null) return true;
+  if (px < 0 || py < 0 || px > room.w || py > room.h) return true;
+  for (const slab of room.walls) {
+    if (inside(px, py, slab)) return true;
+  }
+  for (const piece of room.cover) {
+    if (inside(px, py, piece)) return true;
+  }
   for (const door of room.doors ?? []) {
-    if (!door.open && pointInRect(x, y, door)) return true;
+    if (!door.open && inside(px, py, door)) return true;
   }
   return false;
 }
 
-/** True when the sight line between two points crosses any wall. Cover never blocks sight. */
-export function losBlocked(room, ax, ay, bx, by) {
-  if (!room) return true;
-  for (const wall of room.walls) {
-    if (segmentHitsRect(ax, ay, bx, by, wall)) return true;
+/** True when a straight sight line between two points crosses any wall. */
+export function losBlocked(room, x1, y1, x2, y2) {
+  if (room == null) return true;
+  for (const slab of room.walls) {
+    if (rayHitsBox(x1, y1, x2, y2, slab)) return true;
   }
   return false;
 }
 
 /** The room's exit, as a fresh point. */
-export function roomExit(room) {
-  return { x: room.exit.x, y: room.exit.y };
-}
+export function roomExit(room) { return { x: room.exit.x, y: room.exit.y }; }
 
 // ---------------------------------------------------------------------------
 // City
 // ---------------------------------------------------------------------------
 
-/** Horizontal road bands and vertical road bands across the 2560x1600 map. */
-const ROAD_BANDS_H = [
+/** East-west road bands and north-south road bands across the 2560x1600 map. */
+const AVENUES_EW = [
   { from: 240, to: 350 },
   { from: 745, to: 855 },
   { from: 1250, to: 1360 },
 ];
-const ROAD_BANDS_V = [
+const AVENUES_NS = [
   { from: 430, to: 540 },
   { from: 1225, to: 1335 },
   { from: 1980, to: 2090 },
 ];
 
 /**
- * Build the getaway grid: three avenues each way, building blocks filling
- * the cells between them, lamps along the kerbs, the crew's start on the
- * west end of the middle avenue and the safehouse on the far south-east
- * road — a long drive across the whole map.
+ * The stretches of open ground between road bands: from the map's edge to
+ * the first band, between each pair of bands, and from the last band to the
+ * far edge. Buildings sit inside these stretches, never on a road.
  */
-export function buildCity(rng) {
+function gapsBetween(bands, total, edge, clearance) {
+  const spans = [];
+  let start = edge;
+  for (const band of bands) {
+    spans.push({ from: start, to: band.from - clearance });
+    start = band.to + clearance;
+  }
+  spans.push({ from: start, to: total - edge });
+  return spans;
+}
+
+/**
+ * Lay out the getaway grid: three avenues each way, building blocks filling
+ * the cells between them, lamps along the kerbs, the crew starting on the
+ * west end of the middle avenue and the safehouse waiting on the far
+ * south-east road — a long drive across the whole map.
+ */
+export function buildCity(stream) {
   const roads = [];
-  for (const band of ROAD_BANDS_H) {
+  for (const band of AVENUES_EW) {
     roads.push({ x: 0, y: band.from, w: CITY.width, h: band.to - band.from, dir: 'h' });
   }
-  for (const band of ROAD_BANDS_V) {
+  for (const band of AVENUES_NS) {
     roads.push({ x: band.from, y: 0, w: band.to - band.from, h: CITY.height, dir: 'v' });
   }
-  const cellXs = [
-    { from: 60, to: ROAD_BANDS_V[0].from - 30 },
-    { from: ROAD_BANDS_V[0].to + 30, to: ROAD_BANDS_V[1].from - 30 },
-    { from: ROAD_BANDS_V[1].to + 30, to: ROAD_BANDS_V[2].from - 30 },
-    { from: ROAD_BANDS_V[2].to + 30, to: CITY.width - 60 },
-  ];
-  const cellYs = [
-    { from: 60, to: ROAD_BANDS_H[0].from - 30 },
-    { from: ROAD_BANDS_H[0].to + 30, to: ROAD_BANDS_H[1].from - 30 },
-    { from: ROAD_BANDS_H[1].to + 30, to: ROAD_BANDS_H[2].from - 30 },
-    { from: ROAD_BANDS_H[2].to + 30, to: CITY.height - 60 },
-  ];
+  const columns = gapsBetween(AVENUES_NS, CITY.width, 60, 30);
+  const rows = gapsBetween(AVENUES_EW, CITY.height, 60, 30);
   const blocks = [];
-  for (const cx of cellXs) {
-    for (const cy of cellYs) {
-      // Leave an occasional open plaza so the grid is not a solid wall of roofs.
-      if (rng.chance(0.12)) continue;
-      const inset = 14 + rng.next() * 18;
+  for (const column of columns) {
+    for (const row of rows) {
+      // Now and then leave a cell open as a plaza, so the grid is not one
+      // unbroken wall of rooftops.
+      if (stream.chance(0.12)) continue;
+      const inset = 14 + stream.next() * 18;
       blocks.push({
-        x: cx.from + inset,
-        y: cy.from + inset,
-        w: cx.to - cx.from - inset * 2,
-        h: cy.to - cy.from - inset * 2,
+        x: column.from + inset,
+        y: row.from + inset,
+        w: column.to - column.from - inset * 2,
+        h: row.to - row.from - inset * 2,
       });
     }
   }
   const lamps = [];
-  for (const band of ROAD_BANDS_H) {
+  // One lamp pair per stretch of kerb on every avenue, both sides of the
+  // road, so the getaway drive is lit end to end and no avenue goes dark.
+  for (const band of AVENUES_EW) {
     for (let x = 180; x < CITY.width; x += 260) {
-      lamps.push({ x: x + drift(rng, 20), y: band.from - 14 });
-      lamps.push({ x: x + 130 + drift(rng, 20), y: band.to + 14 });
+      lamps.push({ x: x + wobble(stream, 20), y: band.from - 14 });
+      lamps.push({ x: x + 130 + wobble(stream, 20), y: band.to + 14 });
     }
   }
-  for (const band of ROAD_BANDS_V) {
+  for (const band of AVENUES_NS) {
     for (let y = 180; y < CITY.height; y += 300) {
-      lamps.push({ x: band.from - 14, y: y + drift(rng, 20) });
+      lamps.push({ x: band.from - 14, y: y + wobble(stream, 20) });
     }
   }
   return {
     w: CITY.width,
     h: CITY.height,
-    roads,
-    blocks,
-    lamps,
+    roads: roads,
+    blocks: blocks,
+    lamps: lamps,
     spawn: { x: 300, y: 800 },
     carSpawn: { x: 380, y: 800 },
     safehouse: { x: 2280, y: 1305 },
@@ -484,14 +675,14 @@ export function buildCity(rng) {
 }
 
 /** True when the point is inside a building block or outside the city. */
-export function citySolidAt(city, x, y) {
-  if (!city) return true;
-  if (x < 0 || y < 0 || x > city.w || y > city.h) return true;
-  for (const block of city.blocks) if (pointInRect(x, y, block)) return true;
+export function citySolidAt(city, px, py) {
+  if (city == null) return true;
+  if (px < 0 || py < 0 || px > city.w || py > city.h) return true;
+  for (const block of city.blocks) {
+    if (inside(px, py, block)) return true;
+  }
   return false;
 }
 
 /** The safehouse, as a fresh point. */
-export function citySafehouse(city) {
-  return { x: city.safehouse.x, y: city.safehouse.y };
-}
+export function citySafehouse(city) { return { x: city.safehouse.x, y: city.safehouse.y }; }

@@ -1,233 +1,236 @@
-// Senja Heist — jobs, objectives, payouts and the planning board.
+// Senja Heist — the campaign ledger: which scores are on the board, what a
+// finished night pays, and what the crew can buy before they go in.
 //
-// This module is pure data plus small decisions: it never touches the
-// canvas and never mutates the world. main.js asks it what the campaign
-// looks like (which jobs are open, what the crew still has to do, what a
-// finished score is worth) and the planning board renders the answers.
+// Nothing here draws pixels or steps the simulation. It answers questions
+// from main.js: what jobs exist, which objectives are still open, how much
+// a haul is worth, and what the planning screen should show. State flows
+// in, plain objects flow out; the only writes happen inside buyTool, which
+// spends cash and stocks the tool bag.
 //
-// Money rule: a payout is the loot actually carried out, plus a speed
-// bonus for a quick room, plus a ghost bonus for never letting the alarm
-// climb past the point where the crew gets suspicious. The two bonuses
-// are reported separately and summed into `bonus`.
+// How a score pays out: the crew banks exactly the loot they walk out
+// with, then two extras stack on top. A fast room earns a speed bonus that
+// fades as the clock runs, and a run where the alarm never rose past the
+// suspicious line earns a ghost cut of the haul. On top of the cash, every
+// finished job banks crew XP that grows with the job's place in the list,
+// and the chosen difficulty scales the whole cash total.
 
-import { ALARM, TOOLS } from './config.js';
+import { ALARM, DIFFICULTY, TOOLS } from './config.js';
 
-/** How many seconds in the room still earns the full speed bonus. */
-const FAST_ROOM_SECONDS = 90;
-/** Past this many seconds in the room the speed bonus is gone entirely. */
-const SLOW_ROOM_SECONDS = 300;
-/** The biggest speed bonus a job can pay, in dollars. */
+// Seconds inside before the speed bonus starts shrinking.
+const FAST_ROOM = 90;
+// Seconds inside at which the speed bonus has faded to nothing.
+const SLOW_ROOM = 300;
+// Largest speed bonus a job can pay, in dollars.
 const MAX_TIME_BONUS = 500;
-/** Ghost bonus: this share of the carried loot, when the alarm stayed quiet. */
+// Ghost cut: this fraction of the carried loot when the alarm stayed quiet.
 const GHOST_SHARE = 0.1;
-/** EMP charges one purchase adds, and the most charges the crew can hold. */
+// How many charges one purchase of a charge-based tool adds.
 const EMP_PACK = 3;
+// Most charges of one tool the crew can carry at once.
 const EMP_MAX = 9;
+// XP banked for finishing any job, plus this much per job index.
+const XP_BASE = 40;
+const XP_PER_JOB = 15;
+// Fallback difficulty table, used only if config has not defined one yet.
+const FALLBACK_DIFFICULTY = { normal: { payoutMul: 1 } };
 
-/**
- * The five jobs of the campaign, in climbing order. `take` is the headline
- * value of the loot on site — the crew only banks what they actually carry
- * out. `guards` and `cameras` are the counts world.js builds the room from;
- * `vault` marks the jobs with a vault minigame instead of grab-and-go loot.
- */
+// The campaign, in rising order of heat. `take` is the headline value of
+// everything sitting in the room — the crew only banks what they actually
+// carry out the door. `guards` and `cameras` are the counts world.js uses
+// to build the room; `vault` means the job ends with the vault minigame
+// instead of simple grab-and-go loot.
 export const JOBS = [
-  {
-    id: 'pawnshop',
-    name: 'Pawnshop Lights',
-    target: 'Marlow Pawnshop',
-    take: 4800,
-    guards: 2,
-    cameras: 1,
-    vault: false,
-    blurb: 'A quiet till, a sleepy guard, a first score.',
-  },
-  {
-    id: 'jewellers',
-    name: 'Glass & Gold',
-    target: 'Aurelia Jewellers',
-    take: 18500,
-    guards: 3,
-    cameras: 2,
-    vault: false,
-    blurb: 'Glass cases, gold chains, two cameras over the door.',
-  },
-  {
-    id: 'gallery',
-    name: 'The Quiet Gallery',
-    target: 'Galeri Nara',
-    take: 44000,
-    guards: 3,
-    cameras: 3,
-    vault: true,
-    blurb: 'Art on the walls and a small vault behind the office.',
-  },
-  {
-    id: 'bank',
-    name: 'Meridian Vault',
-    target: 'Meridian Bank',
-    take: 128000,
-    guards: 5,
-    cameras: 4,
-    vault: true,
-    blurb: 'Five guards, four cameras, one very serious door.',
-  },
-  {
-    id: 'museum',
-    name: 'The Senja Museum',
-    target: 'Museum Senja',
-    take: 310000,
-    guards: 6,
-    cameras: 5,
-    vault: true,
-    blurb: 'The big one. The whole city will hear about this.',
-  },
+  { id: 'pawnshop', name: 'Pawnshop Lights', target: 'Marlow Pawnshop', take: 4800, guards: 2, cameras: 1, vault: false, blurb: 'A quiet till, a sleepy guard, a first score.' },
+  { id: 'jewellers', name: 'Glass & Gold', target: 'Aurelia Jewellers', take: 18500, guards: 3, cameras: 2, vault: false, blurb: 'Glass cases, gold chains, two cameras over the door.' },
+  { id: 'gallery', name: 'The Quiet Gallery', target: 'Galeri Nara', take: 44000, guards: 3, cameras: 3, vault: true, blurb: 'Art on the walls and a small vault behind the office.' },
+  { id: 'bank', name: 'Meridian Vault', target: 'Meridian Bank', take: 128000, guards: 5, cameras: 4, vault: true, blurb: 'Five guards, four cameras, one very serious door.' },
+  { id: 'museum', name: 'The Senja Museum', target: 'Museum Senja', take: 310000, guards: 6, cameras: 5, vault: true, blurb: 'The big one. The whole city will hear about this.' },
+  { id: 'casino', name: 'Kasino Meridian', target: 'Kasino Meridian', take: 420000, guards: 7, cameras: 6, vault: true, blurb: 'Chips stacked high, seven guards on the floor, and a cage full of cash behind the vault door.' },
+  { id: 'penthouse', name: 'Penthouse Aurelia', target: 'Penthouse Aurelia', take: 540000, guards: 8, cameras: 6, vault: true, blurb: 'The last score. Eight guards, a rooftop view, and a safe that holds a fortune in one room.' },
 ];
 
-/**
- * The job at `index`. Indexes past the end clamp to the last job, so a
- * replayed campaign and a stale save both land on the museum, never on
- * undefined.
- */
+// Pin an index into the legal range so stale saves and replayed campaigns
+// always land on a real job instead of falling off the end of the list.
+function pinIndex(index) {
+  const n = Number.isFinite(index) ? Math.floor(index) : 0;
+  return Math.max(0, Math.min(n, JOBS.length - 1));
+}
+
+// The job at `index`; anything past the end clamps to the final job.
 export function jobFor(index) {
-  const clamped = Math.max(0, Math.min(Math.floor(index), JOBS.length - 1));
-  return JOBS[clamped];
+  return JOBS[pinIndex(index)];
 }
 
-/** True when every piece of loot in the room has been lifted. */
-function lootLifted(state) {
-  const loot = Array.isArray(state.loot) ? state.loot : [];
-  return loot.length > 0 && loot.every((item) => item.taken);
-}
-
-/** True when the job has no vault, or its vault stands open. */
-function vaultCracked(state) {
-  if (!state.mission || !state.mission.vault) return true;
-  return state.vault !== null && state.vault !== undefined && state.vault.state === 'open';
-}
-
-/**
- * The objective list for the current job, in the order the crew reads it.
- * Every job needs the loot lifted and the exit reached; vault jobs add the
- * crack in the middle. The exit reads as done once the rest of the job is
- * done — reaching it is the last step, and main.js only lets the crew leave
- * through it when everything required is finished.
- */
-export function jobObjectives(state) {
-  const lifted = lootLifted(state);
-  const cracked = vaultCracked(state);
-  const list = [{ text: 'Lift the loot', done: lifted, required: true }];
-  if (state.mission && state.mission.vault) {
-    list.push({ text: 'Crack the vault', done: cracked, required: true });
+// True when the room holds loot and every last piece of it is lifted.
+function allLootLifted(state) {
+  const roomLoot = Array.isArray(state.loot) ? state.loot : [];
+  if (roomLoot.length === 0) return false;
+  for (const piece of roomLoot) {
+    if (!piece.taken) return false;
   }
-  list.push({ text: 'Reach the exit', done: lifted && cracked, required: true });
-  return list;
+  return true;
 }
 
-/** True when every required objective on the board is checked off. */
+// True when the job has no vault at all, or its vault already stands open.
+function vaultIsOpen(state) {
+  const mission = state.mission || {};
+  if (!mission.vault) return true;
+  return Boolean(state.vault && state.vault.state === 'open');
+}
+
+// The objective list for the job in progress, in the order the crew reads
+// it. Every job needs the loot lifted and the exit reached; vault jobs add
+// the crack between them. The exit counts as done once the rest is done —
+// it is the last step, and main.js only lets the crew leave through it
+// once everything required is finished.
+export function jobObjectives(state) {
+  const lifted = allLootLifted(state);
+  const cracked = vaultIsOpen(state);
+  const board = [];
+  board.push({ text: 'Lift the loot', done: lifted, required: true });
+  if (state.mission && state.mission.vault) {
+    board.push({ text: 'Crack the vault', done: cracked, required: true });
+  }
+  board.push({ text: 'Reach the exit', done: lifted && cracked, required: true });
+  return board;
+}
+
+// True when every required line on the objective board is checked off.
 export function objectivesDone(state) {
-  return jobObjectives(state).every((objective) => !objective.required || objective.done);
+  const board = jobObjectives(state);
+  for (const line of board) {
+    if (line.required && !line.done) return false;
+  }
+  return true;
 }
 
-/** Value of the loot the thief is carrying out, from the vault module's tally. */
-function carriedValue(state) {
-  const carrying = state.player && Array.isArray(state.player.carrying)
+// Add up the value of everything the thief is carrying out the door.
+function haulValue(state) {
+  const pocket = state.player && Array.isArray(state.player.carrying)
     ? state.player.carrying
     : [];
-  let total = 0;
-  for (const item of carrying) total += item.value || 0;
-  return total;
+  let sum = 0;
+  for (const piece of pocket) sum += piece.value || 0;
+  return sum;
 }
 
-/**
- * Speed bonus: the full $500 for a room cleared inside FAST_ROOM_SECONDS,
- * sliding linearly down to nothing at SLOW_ROOM_SECONDS. A slow, careful
- * crew still banks the loot; they just do not get paid for being quick.
- */
-function speedBonus(state) {
-  const seconds = state.stats && typeof state.stats.timeInRoom === 'number'
-    ? state.stats.timeInRoom
-    : 0;
-  if (seconds <= FAST_ROOM_SECONDS) return MAX_TIME_BONUS;
-  if (seconds >= SLOW_ROOM_SECONDS) return 0;
-  const share = (SLOW_ROOM_SECONDS - seconds) / (SLOW_ROOM_SECONDS - FAST_ROOM_SECONDS);
-  return Math.round(MAX_TIME_BONUS * share);
+// How long the crew has spent inside the room, in seconds.
+function roomSeconds(state) {
+  const t = state.stats && state.stats.timeInRoom;
+  return typeof t === 'number' ? t : 0;
 }
 
-/**
- * Ghost bonus: 10% of the carried loot when the alarm never climbed past
- * the suspicion line and never tripped once. The alarm meter decays, so the
- * trip counter is the memory — a crew that spiked the alarm and waited it
- * out does not count as ghosts.
- */
-function ghostBonus(state, loot) {
-  const tripped = state.stats && state.stats.alarmsTripped > 0;
-  if (tripped || state.alarm >= ALARM.suspectAt) return 0;
+// Speed bonus: the full amount for a room cleared inside FAST_ROOM, then a
+// straight slide down to nothing at SLOW_ROOM. A slow, careful crew still
+// banks the loot; they simply do not get paid for being quick.
+function quickBonus(state) {
+  const seconds = roomSeconds(state);
+  if (seconds <= FAST_ROOM) return MAX_TIME_BONUS;
+  if (seconds >= SLOW_ROOM) return 0;
+  const remaining = (SLOW_ROOM - seconds) / (SLOW_ROOM - FAST_ROOM);
+  return Math.round(MAX_TIME_BONUS * remaining);
+}
+
+// Ghost bonus: a slice of the carried loot when the alarm never tripped
+// and never even reached the suspicion line. The meter decays on its own,
+// so the trip counter is the memory — a crew that spiked the alarm and
+// waited it out does not count as ghosts.
+function quietBonus(state, loot) {
+  const stats = state.stats || {};
+  const everTripped = stats.alarmsTripped > 0;
+  const tooLoud = state.alarm >= ALARM.suspectAt;
+  if (everTripped || tooLoud) return 0;
   return Math.round(loot * GHOST_SHARE);
 }
 
-/**
- * The payout for the job just finished. `loot` is the carried value,
- * `timeBonus` and `ghostBonus` are the two extras, `bonus` is their sum,
- * and `total` is what lands in the bank.
- */
-export function payoutFor(state) {
-  const loot = carriedValue(state);
-  const time = speedBonus(state);
-  const ghost = ghostBonus(state, loot);
-  const bonus = time + ghost;
-  return { loot, bonus, timeBonus: time, ghostBonus: ghost, total: loot + bonus };
+// Which job number this payout belongs to, defaulting to the first job
+// and never going below zero, so a corrupt save cannot pay negative XP.
+function payoutJobIndex(state) {
+  const n = state.jobIndex;
+  if (typeof n !== 'number' || !Number.isFinite(n)) return 0;
+  return Math.max(0, Math.floor(n));
 }
 
-/**
- * Everything the planning board needs in one object: the job list with
- * each job's lock state, the tool shop with prices and what the crew
- * already owns, the crew's current role picks, and the banked cash.
- * Job `i` unlocks once `i` jobs are done; a finished job stays open for
- * replays.
- */
+// Multiplier for the chosen difficulty; unknown keys fall back to normal.
+function payoutMultiplier(state) {
+  const table = DIFFICULTY || FALLBACK_DIFFICULTY;
+  const key = state.difficulty ?? 'normal';
+  const entry = table[key] || table.normal || { payoutMul: 1 };
+  return typeof entry.payoutMul === 'number' ? entry.payoutMul : 1;
+}
+
+// The payout for the job just finished. `loot` is the carried value,
+// `timeBonus` and `ghostBonus` are the two extras, `bonus` is their sum,
+// `total` is the cash that lands in the bank after the difficulty
+// multiplier, and `xp` is the crew experience the job banks.
+export function payoutFor(state) {
+  const loot = haulValue(state);
+  const time = quickBonus(state);
+  const ghost = quietBonus(state, loot);
+  const bonus = time + ghost;
+  const total = Math.round((loot + bonus) * payoutMultiplier(state));
+  const xp = XP_BASE + XP_PER_JOB * payoutJobIndex(state);
+  return { loot, bonus, timeBonus: time, ghostBonus: ghost, total, xp };
+}
+
+// One entry of the tool shop, in display form. A tool that carries
+// `charges` is a count tool — owned while at least one charge is held, and
+// the count is shown. A tool without `charges` is a one-off: owned once
+// bought, full stop. Nothing here hardcodes which tools exist; any tool
+// config gains is picked up by the same rule.
+function shopEntry(id, tool, bag) {
+  const isChargeTool = typeof tool.charges === 'number';
+  const held = isChargeTool ? (bag[id] || 0) : bag[id];
+  return {
+    id,
+    name: tool.name,
+    cost: tool.cost,
+    owned: isChargeTool ? held > 0 : held === true,
+    charges: isChargeTool ? held : undefined,
+    desc: tool.desc,
+  };
+}
+
+// Everything the planning board needs in one object: the job list with
+// each job's lock state, the tool shop with prices and what the crew
+// already owns, the crew's current role picks, the banked cash, and the
+// difficulty the next job will run at. Job `i` unlocks once `i` jobs are
+// done; a finished job stays open for replays.
 export function planOptions(state) {
-  const jobsDone = typeof state.jobsDone === 'number' ? state.jobsDone : 0;
+  const finished = typeof state.jobsDone === 'number' ? state.jobsDone : 0;
   const jobs = JOBS.map((job, i) => ({
     job,
-    unlocked: i <= jobsDone,
-    done: i < jobsDone,
+    unlocked: i <= finished,
+    done: i < finished,
   }));
-  const shop = Object.entries(TOOLS).map(([id, tool]) => {
-    const owned = id === 'emp'
-      ? state.tools.emp > 0
-      : state.tools[id] === true;
-    return {
-      id,
-      name: tool.name,
-      cost: tool.cost,
-      owned,
-      charges: id === 'emp' ? state.tools.emp : undefined,
-      desc: tool.desc,
-    };
-  });
+  const bag = state.tools || {};
+  const shop = Object.entries(TOOLS).map(([id, tool]) => shopEntry(id, tool, bag));
   const crew = Array.isArray(state.crew)
     ? state.crew.map((member) => ({ id: member.id, name: member.name, role: member.role }))
     : [];
-  return { jobs, shop, crew, cash: state.cash };
+  return { jobs, shop, crew, cash: state.cash, difficulty: state.difficulty ?? 'normal' };
 }
 
-/**
- * Buy a tool for the crew. Returns false when the tool does not exist,
- * when the crew cannot afford it, or when it is already owned — an EMP
- * purchase is the exception: it tops up charges, 3 at a time, up to 9.
- * A successful purchase deducts the cash and updates `state.tools`.
- */
+// Buy a tool for the crew. Returns false when the tool does not exist,
+// when the crew cannot afford it, when a one-off tool is already owned, or
+// when a charge tool is already at the cap. A charge tool tops up by its
+// own pack size (3 by default) up to EMP_MAX; a one-off tool is bought
+// once. The cap applies to every charge tool alike, not just the EMP.
+// A successful purchase deducts the cash and updates `state.tools`.
 export function buyTool(state, toolId) {
   const tool = TOOLS[toolId];
   if (!tool) return false;
   if (state.cash < tool.cost) return false;
-  if (toolId === 'emp') {
-    if (state.tools.emp >= EMP_MAX) return false;
-    state.tools.emp = Math.min(EMP_MAX, state.tools.emp + (tool.charges ?? EMP_PACK));
+  const bag = state.tools || {};
+  if (typeof tool.charges === 'number') {
+    const held = bag[toolId] || 0;
+    if (held >= EMP_MAX) return false;
+    bag[toolId] = Math.min(EMP_MAX, held + (tool.charges ?? EMP_PACK));
   } else {
-    if (state.tools[toolId] === true) return false;
-    state.tools[toolId] = true;
+    if (bag[toolId] === true) return false;
+    bag[toolId] = true;
   }
+  state.tools = bag;
   state.cash -= tool.cost;
   return true;
 }

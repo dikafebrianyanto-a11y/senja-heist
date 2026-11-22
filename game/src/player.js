@@ -1,30 +1,43 @@
-// player.js — Mara Voss, the thief the player drives.
+// player.js — Mara Voss, the thief on foot.
 //
-// Top-down movement with three gaits: crouch is slow and quiet and makes
-// Mara harder to spot, a walk is the working pace, a sprint is fast and
-// loud. Everything she lifts has weight, and past a threshold the bag
-// drags her down — a full haul is a slow walk to the exit. Collision is
-// axis-separated against the room's walls and cover during a heist and
-// against the city's building blocks on foot during a getaway, so she
-// slides along a wall instead of sticking to it.
+// Three gaits, three noise levels. Crouching creeps along slow and quiet
+// and makes her a smaller target; walking is the working pace; sprinting
+// is fast and loud enough for the whole floor to hear. Everything she
+// lifts has weight, and past a threshold the bag drags her down, so a full
+// haul is a slow walk to the door. Walls are tested one axis at a time,
+// which lets a diagonal push slide along a wall instead of jamming.
+// Smoke charges ride in her pocket, topped up from the crew's tool bag
+// when a job starts, and the leader's speed bonus stretches every gait.
+// The step also records whether she is sprinting right now, so combat can
+// tell a disguised walk apart from a disguised sprint.
 
 import { THIEF, SCREEN } from './config.js';
 import { roomSolidAt, citySolidAt } from './world.js';
 
-/** How far past the weight threshold the thief can still be slowed. */
-const MIN_SPEED = 42;
+/** Floor on the pace: no load ever drags Mara below this, px per second. */
+const PACE_FLOOR = 42;
+
+/** Probe directions for wall tests, as fractions of the thief's radius. */
+const PROBE_DIRS = [
+  [0, -1], [0, 1], [-1, 0], [1, 0],
+  [-0.7, -0.7], [0.7, -0.7], [-0.7, 0.7], [0.7, 0.7],
+];
 
 /**
- * Fresh thief at a spawn point, matching the shared player shape:
- * position, facing, gait flags, noise the guards can hear, carried loot
- * and its weight, health, ammo, and the action cooldowns main.js reads.
+ * A fresh thief at a spawn point. `tools` is optional: when the caller
+ * hands over the crew's tool bag, the smoke charges carried come from it;
+ * otherwise the pocket starts empty and the first step syncs it from
+ * state.tools instead. `speedMul` starts at 1 and is stretched by whoever
+ * applies the leader's crew bonus; `smokeSynced` records which source the
+ * pocket was filled from, so the first step never tops it up twice.
  */
-export function createThief(x, y) {
+export function createThief(x, y, tools) {
   return {
     x,
     y,
     facing: 0,
     speed: 0,
+    sprinting: false,
     crouched: false,
     moving: false,
     noise: 0,
@@ -34,6 +47,9 @@ export function createThief(x, y) {
     hp: THIEF.hp,
     maxHp: THIEF.hp,
     ammo: THIEF.ammoStart,
+    smoke: tools?.smoke ?? 0,
+    smokeSynced: tools !== undefined,
+    speedMul: 1,
     disguised: false,
     disguiseTimer: 0,
     hidden: false,
@@ -42,121 +58,155 @@ export function createThief(x, y) {
   };
 }
 
+/** Kilos past the threshold, expressed as a pace penalty in px per second. */
+function loadDrag(thief) {
+  const over = Math.max(0, thief.weight - THIEF.weightSlowsAt);
+  return over * THIEF.weightSlowPerKg;
+}
+
+/** The leader's speed bonus, or 1 when nobody set one. */
+function paceBonus(thief) {
+  return typeof thief.speedMul === 'number' ? thief.speedMul : 1;
+}
+
+/** Base pace for a gait, before load and before the leader's bonus. */
+function gaitBase(move) {
+  if (move.crouch) return THIEF.crouch;
+  if (move.sprint) return THIEF.sprint;
+  return THIEF.walk;
+}
+
+/** Live pace for this step: gait pace, stretched by the bonus, dragged by the bag. */
+function livePace(state, move) {
+  const thief = state.player;
+  const raw = gaitBase(move) * paceBonus(thief);
+  return Math.max(PACE_FLOOR, raw - loadDrag(thief));
+}
+
 /**
- * Current effective speed: the gait's base pace, minus a penalty for
- * every kilo carried past the threshold where the bag starts to drag.
- * Crouching with a heavy bag is the slowest Mara ever moves.
+ * The pace the HUD and other modules read: walk or crouch only, since
+ * sprint is a live flag on the step rather than a stored gait — with the
+ * same bonus and load rules as the live pace.
  */
 export function thiefSpeed(state) {
-  const player = state.player;
-  if (!player) return 0;
-  const base = player.crouched ? THIEF.crouch : THIEF.walk;
-  // Sprint is a live gait flag on the step call, not stored on the
-  // player, so this stored pace is walk/crouch; stepThief folds the
-  // sprint pace in through `player.speed` while a sprint is happening.
-  const excess = Math.max(0, player.weight - THIEF.weightSlowsAt);
-  return Math.max(MIN_SPEED, base - excess * THIEF.weightSlowPerKg);
+  const thief = state.player;
+  if (!thief) return 0;
+  const base = thief.crouched ? THIEF.crouch : THIEF.walk;
+  const raw = base * paceBonus(thief);
+  return Math.max(PACE_FLOOR, raw - loadDrag(thief));
 }
 
-/** Live pace for this step, given the move's gait flags. */
-function paceFor(state, move) {
-  const player = state.player;
-  const base = move.crouch ? THIEF.crouch : move.sprint ? THIEF.sprint : THIEF.walk;
-  const excess = Math.max(0, player.weight - THIEF.weightSlowsAt);
-  return Math.max(MIN_SPEED, base - excess * THIEF.weightSlowPerKg);
-}
-
-/** Noise radius thrown by the current gait, or 0 while standing still. */
-function noiseFor(move, moving) {
+/** Noise radius for the gait being used, or silence while standing still. */
+function gaitNoise(move, moving) {
   if (!moving) return 0;
   if (move.crouch) return THIEF.noiseCrouch;
   if (move.sprint) return THIEF.noiseSprint;
   return THIEF.noiseWalk;
 }
 
-/**
- * True when a circle of the thief's radius centred at (x, y) would touch
- * anything solid in the place she is standing in right now.
- */
-function bodyBlocked(state, x, y) {
-  const r = THIEF.radius;
-  const probes = [
-    [x, y - r], [x, y + r], [x - r, y], [x + r, y],
-    [x - r * 0.7, y - r * 0.7], [x + r * 0.7, y - r * 0.7],
-    [x - r * 0.7, y + r * 0.7], [x + r * 0.7, y + r * 0.7],
-  ];
-  if (state.screen === SCREEN.GETAWAY && state.city) {
-    return probes.some(([px, py]) => citySolidAt(state.city, px, py));
+// A sprint that starts from a standstill still counts as moving: the
+// noise for the step is set from the gait flags, not from the speed.
+
+/** Tick the action and disguise timers down by dt, never below zero. */
+function tickTimers(thief, dt) {
+  if (thief.punchTimer > 0) thief.punchTimer = Math.max(0, thief.punchTimer - dt);
+  if (thief.shootTimer > 0) thief.shootTimer = Math.max(0, thief.shootTimer - dt);
+  if (thief.disguiseTimer > 0) {
+    thief.disguiseTimer = Math.max(0, thief.disguiseTimer - dt);
+    if (thief.disguiseTimer === 0) thief.disguised = false;
   }
-  if (state.room) {
-    return probes.some(([px, py]) => roomSolidAt(state.room, px, py));
-  }
-  if (state.city) {
-    return probes.some(([px, py]) => citySolidAt(state.city, px, py));
-  }
-  return false;
 }
 
 /**
- * Advance the thief one fixed step. `move` is a normalised vector plus
- * gait flags. Sets `moving`, `facing`, `speed`, `crouched` and `noise`;
- * ticks the action and disguise timers down; walks axis by axis so a
- * diagonal push slides along a wall instead of stopping dead.
+ * True when a circle of the thief's radius around (x, y) touches anything
+ * solid where she is standing: room walls and cover during a heist, city
+ * blocks on foot during a getaway.
+ */
+function blockedAt(state, x, y) {
+  const r = THIEF.radius;
+  let solid = null;
+  if (state.screen === SCREEN.GETAWAY && state.city) {
+    solid = (px, py) => citySolidAt(state.city, px, py);
+  } else if (state.room) {
+    solid = (px, py) => roomSolidAt(state.room, px, py);
+  } else if (state.city) {
+    solid = (px, py) => citySolidAt(state.city, px, py);
+  }
+  if (!solid) return false;
+  return PROBE_DIRS.some(([dx, dy]) => solid(x + dx * r, y + dy * r));
+}
+
+/** Fade the noise out once the thief stops moving. */
+function settleNoise(thief, dt) {
+  if (thief.noiseTimer > 0) {
+    thief.noiseTimer = Math.max(0, thief.noiseTimer - dt);
+    if (thief.noiseTimer === 0) thief.noise = 0;
+  } else {
+    thief.noise = 0;
+  }
+}
+
+/**
+ * Advance the thief one fixed step. `move` is a normalised direction plus
+ * gait flags. Updates moving, facing, speed, sprinting, crouched and noise,
+ * ticks the timers, and walks axis by axis so a diagonal push slides
+ * along a wall instead of stopping dead.
  */
 export function stepThief(state, dt, move) {
-  const player = state.player;
-  if (!player || !move) return;
-  if (player.punchTimer > 0) player.punchTimer = Math.max(0, player.punchTimer - dt);
-  if (player.shootTimer > 0) player.shootTimer = Math.max(0, player.shootTimer - dt);
-  if (player.disguiseTimer > 0) {
-    player.disguiseTimer = Math.max(0, player.disguiseTimer - dt);
-    if (player.disguiseTimer === 0) player.disguised = false;
+  const thief = state.player;
+  if (!thief || !move) return;
+  tickTimers(thief, dt);
+  // Fill the pocket once from the crew's tool bag, the first step of the
+  // job. After that the count is the thief's own: spending a charge in
+  // combat must never be undone by a later step re-reading the bag.
+  if (typeof thief.smoke !== 'number') thief.smoke = state.tools?.smoke ?? 0;
+  if (!thief.smokeSynced && typeof state.tools?.smoke === 'number') {
+    thief.smoke = state.tools.smoke;
+    thief.smokeSynced = true;
   }
 
-  player.crouched = Boolean(move.crouch);
+  thief.crouched = Boolean(move.crouch);
   const mx = move.x ?? 0;
   const my = move.y ?? 0;
   const len = Math.hypot(mx, my);
-  player.moving = len > 0.01;
-  if (!player.moving) {
-    player.speed = 0;
-    if (player.noiseTimer > 0) {
-      player.noiseTimer = Math.max(0, player.noiseTimer - dt);
-      if (player.noiseTimer === 0) player.noise = 0;
-    } else {
-      player.noise = 0;
-    }
+  thief.moving = len > 0.01;
+  thief.sprinting = thief.moving && Boolean(move.sprint);
+  if (!thief.moving) {
+    thief.speed = 0;
+    settleNoise(thief, dt);
     return;
   }
   const nx = mx / len;
   const ny = my / len;
-  player.facing = Math.atan2(ny, nx);
-  const pace = paceFor(state, move);
-  player.speed = pace;
-  const stepX = nx * pace * dt;
-  const stepY = ny * pace * dt;
-  if (!bodyBlocked(state, player.x + stepX, player.y)) player.x += stepX;
-  if (!bodyBlocked(state, player.x, player.y + stepY)) player.y += stepY;
-  player.noise = noiseFor(move, true);
-  player.noiseTimer = 0.25;
+  thief.facing = Math.atan2(ny, nx);
+  const pace = livePace(state, move);
+  thief.speed = pace;
+  const dx = nx * pace * dt;
+  const dy = ny * pace * dt;
+  if (!blockedAt(state, thief.x + dx, thief.y)) thief.x += dx;
+  if (!blockedAt(state, thief.x, thief.y + dy)) thief.y += dy;
+  thief.noise = gaitNoise(move, true);
+  thief.noiseTimer = 0.25;
 }
 
 /**
- * Take a loot item into the bag. Returns false when it is already taken
- * (or there is no thief); otherwise marks it, adds its weight, and books
- * its value into the run's taken total.
+ * Take a loot item into the bag. False when it is already taken or there
+ * is no thief; otherwise it is marked, its weight joins the bag, and its
+ * value joins the run's taken total.
  */
 export function grabLoot(state, item) {
-  if (!item || item.taken || !state.player) return false;
+  const thief = state.player;
+  if (!thief || !item || item.taken) return false;
   item.taken = true;
-  state.player.carrying.push(item);
-  state.player.weight += item.weight ?? 0;
+  thief.carrying.push(item);
+  thief.weight += item.weight ?? 0;
   if (state.stats) state.stats.taken += item.value ?? 0;
   return true;
 }
 
 /** Hurt the thief, clamping health at zero; main.js busts at zero. */
 export function thiefHurt(state, dmg) {
-  if (!state.player) return;
-  state.player.hp = Math.max(0, state.player.hp - (dmg ?? 0));
+  const thief = state.player;
+  if (!thief) return;
+  thief.hp = Math.max(0, thief.hp - (dmg ?? 0));
 }
