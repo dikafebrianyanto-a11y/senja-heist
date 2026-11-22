@@ -1,63 +1,61 @@
-// Senja Heist — the hand-in program (Node 22, standard library only).
-// The game itself is the plain static site under game/ (game/index.html
-// plus its ES modules, no library, no network request), and this program
-// hands it in: it copies game/ and screenshots/ from beside this file
-// into /output (or $MAKEFUN_OUTPUT_DIR outside the grader's container)
-// and writes /output/dossier.json, the summary the judge reads, using the
-// vendored make.fun library.
+// SENJA HEIST — entrypoint: hands the game in to make.fun.
 //
-// Serve it locally with `node serve.ts`, then open http://localhost:8080.
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// Copies game/ and screenshots/ from this repository into the output
+// directory and writes dossier.json there with buildDossier from
+// vendor/makefun-game.ts. Node 22, standard library only. Running it
+// twice over the same repository writes the same bytes both times:
+// every file is a plain copy and the dossier is built from the
+// copied files, so nothing here depends on clocks, randomness, or
+// the order the filesystem happens to list entries in.
 
-import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { cpSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
 import { buildDossier } from './vendor/makefun-game.ts';
 
-/** The directory this file lives in — the entry root. */
-function entryRoot() {
-  return fileURLToPath(new URL('.', import.meta.url));
-}
+// The repository root: the directory this file lives in.
+const repoRoot = dirname(fileURLToPath(import.meta.url));
 
-/** Where the handed-in entry goes. */
-function outputRoot() {
-  return process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-}
+// The grader hands us a writable /output; anywhere else the
+// MAKEFUN_OUTPUT_DIR environment variable names the target. An
+// empty value is the same as unset: fall back to /output rather
+// than trying to write into the current directory's root.
+const handInDir = process.env.MAKEFUN_OUTPUT_DIR || '/output';
 
-/** Copy one directory tree, creating the destination first. */
-function copyTree(from, to) {
-  mkdirSync(to, { recursive: true });
-  cpSync(from, to, { recursive: true });
-}
-
-/**
- * The scorer's own caps, from the kit's reference/gate.json. Only
- * text_max_bytes shapes the bytes; the rest refuse an entry the scorer
- * would refuse outright: more than 4 screenshots or one over 256 KiB,
- * more than 993 files or 48 MiB under game/, or a game/ path over 1000
- * bytes (game/ counts beside /output's own 1000-entry cap, its
- * screenshots/ and dossier.json).
- */
-const DOSSIER_LIMITS = {
+// The dossier caps this bounty grades against (see the kit's
+// competition.yaml): 160 KiB of source text, at most 4 screenshots
+// of at most 256 KiB each, game/ at most 993 entries / 48 MiB.
+const dossierCaps = {
   text_max_bytes: 163840,
   screenshots: { max: 4, max_bytes: 262144 },
   game_max_files: 993,
   game_max_bytes: 50331648,
-  game_path_max_bytes: 1000,
-};
+} as const;
 
-/** Write the judge's summary for the entry now sitting in `outDir`. */
-function emitDossier(outDir) {
-  writeFileSync(join(outDir, 'dossier.json'), buildDossier(outDir, DOSSIER_LIMITS));
+// One deliverable: a directory under the repository, mirrored
+// wholesale into the same relative path under the hand-in directory.
+const deliverables = ['game', 'screenshots'] as const;
+
+function clearPreviousHandIn(target: string): void {
+  for (const name of deliverables) {
+    rmSync(join(target, name), { recursive: true, force: true });
+  }
+  rmSync(join(target, 'dossier.json'), { force: true });
 }
 
-const root = entryRoot();
-const outDir = outputRoot();
-
-mkdirSync(outDir, { recursive: true });
-copyTree(join(root, 'game'), join(outDir, 'game'));
-mkdirSync(join(outDir, 'screenshots'), { recursive: true });
-if (existsSync(join(root, 'screenshots'))) {
-  copyTree(join(root, 'screenshots'), join(outDir, 'screenshots'));
+function mirrorDeliverables(target: string): void {
+  mkdirSync(target, { recursive: true });
+  for (const name of deliverables) {
+    cpSync(join(repoRoot, name), join(target, name), { recursive: true });
+  }
 }
-emitDossier(outDir);
+
+function writeDossier(target: string): void {
+  const dossier = buildDossier(target, dossierCaps);
+  writeFileSync(join(target, 'dossier.json'), dossier);
+}
+
+clearPreviousHandIn(handInDir);
+mirrorDeliverables(handInDir);
+writeDossier(handInDir);
